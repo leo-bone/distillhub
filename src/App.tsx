@@ -397,7 +397,11 @@ function SkillDetailModal({
           const json = JSON.parse(data)
           // Detect upstream error events (now carries a human-readable detail)
           if (json.error) {
-            throw new Error(`Upstream: ${json.error}${json.detail ? ' — ' + json.detail : ''}`)
+            // hint 是给终端用户看的人话（如"余额不足，去充值"），detail 是上游原始报文
+            const readable = json.hint
+              ? `${json.error}\n${json.hint}`
+              : `${json.error}${json.detail ? ' — ' + json.detail : ''}`
+            throw new Error(`Upstream: ${readable}`)
           }
           const delta = json.choices?.[0]?.delta?.content ?? ''
           fullContent += delta
