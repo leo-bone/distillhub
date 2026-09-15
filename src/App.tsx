@@ -2,6 +2,27 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import { skills, categoryMeta, type Skill, type SkillCategory, type ChatMessage } from './data/skills'
 import { getSystemPrompt } from './data/systemPrompts'
 
+// ─── 访问口令 ─────────────────────────────────────────────────────────────────
+// 站点公开，/api/chat 若不设防，任何人都能消耗你的 DeepSeek 额度。
+// 用法：第一次访问 https://distill.uichain.org/?k=口令  → 自动存进 localStorage，
+// 以后直接打开站点即可（收藏带参数的链接最省事）。服务端未配置 ACCESS_CODE 时此机制不生效。
+const CODE_KEY = 'distill_access_code'
+function accessCode(): string {
+  try {
+    const fromUrl = new URLSearchParams(location.search).get('k')
+    if (fromUrl) {
+      localStorage.setItem(CODE_KEY, fromUrl)
+      // 把口令从地址栏摘掉，避免被截图/分享时带出去
+      const clean = location.pathname + location.hash
+      history.replaceState(null, '', clean)
+      return fromUrl
+    }
+    return localStorage.getItem(CODE_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
 // ─── Icons ────────────────────────────────────────────────────────────────────
 function SearchIcon({ className = 'w-5 h-5' }: { className?: string }) {
   return (
@@ -360,7 +381,10 @@ function SkillDetailModal({
   ): Promise<string> => {
     const res = await fetch('/api/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(accessCode() ? { 'x-access-code': accessCode() } : {}),
+      },
       body: JSON.stringify({ messages: apiMessages, systemPrompt }),
       signal,
     })
@@ -444,9 +468,9 @@ function SkillDetailModal({
       liveMessagesRef.current = []
     }
 
-    // Keep recent 20 messages to avoid token overflow (each exchange = 2 messages)
+    // 只带最近 8 条（4 轮对话）——历史越长每次请求越贵，DeepSeek 按输入 token 计费
     const allHistory = [...liveMessagesRef.current, userMsg]
-    const apiMessages = allHistory.length > 20 ? allHistory.slice(-20) : allHistory
+    const apiMessages = allHistory.length > 8 ? allHistory.slice(-8) : allHistory
     const sp = getSystemPrompt(skill.id)
 
     try {
