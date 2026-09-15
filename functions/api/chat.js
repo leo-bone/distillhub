@@ -80,6 +80,27 @@ export async function onRequestGet(context) {
   }
   info.probe_ms = Date.now() - started;
 
+  // 余额查询：402 Insufficient Balance 是本站最常见的故障，直接把余额摆出来。
+  try {
+    const bal = await fetch('https://api.deepseek.com/user/balance', {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    const b = await bal.json().catch(() => null);
+    if (b) {
+      info.balance_available = b.is_available;
+      info.balance = (b.balance_infos || []).map((x) => ({
+        currency: x.currency,
+        total: x.total_balance,
+        topped_up: x.topped_up_balance,
+        granted: x.granted_balance,
+      }));
+      if (b.is_available === false) info.hint = 'DeepSeek 余额已耗尽，到 platform.deepseek.com/topup 充值。';
+    }
+  } catch (e) {
+    info.balance_error = `${e.name || 'Error'}: ${e.message || String(e)}`;
+  }
+
   return new Response(JSON.stringify(info, null, 2), { status: 200, headers: JSON_HEADERS });
 }
 
@@ -170,9 +191,24 @@ export async function onRequestPost(context) {
     try {
       detail = (await response.text()).slice(0, 500);
     } catch { /* ignore */ }
+
+    const HINTS = {
+      401: 'DeepSeek API Key 无效或已被删除。到 platform.deepseek.com/api_keys 检查，确认后到 Cloudflare Pages 的环境变量里更新并重新部署。',
+      402: 'DeepSeek 账户余额不足（Insufficient Balance）。到 platform.deepseek.com/topup 充值后即可恢复，无需改代码、无需重新部署。',
+      403: '当前 Key 没有该模型的访问权限，或所在区域被限制。检查 model 名称与账号权限。',
+      404: '模型不存在或接口地址已变更。检查 DEEPSEEK_API 常量里的 model 字段。',
+      422: '请求体不符合 DeepSeek 规范（常见于 max_tokens 过大或 messages 格式问题）。',
+      429: '触发 DeepSeek 速率限制（429）。稍等几秒重试即可。',
+    };
+    const hint = HINTS[response.status]
+      || (response.status >= 500
+        ? 'DeepSeek 服务端故障（5xx）。这是上游问题，稍后重试即可。'
+        : '上游返回错误但无具体原因。');
+
     return sseResponse([{
       error: `DeepSeek API ${response.status}`,
-      detail: detail || '上游返回错误但无具体原因（常见：余额不足 402 / Key 无效 401 / 模型无权限 403）。',
+      hint,
+      detail,
     }]);
   }
 
