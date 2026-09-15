@@ -1,0 +1,38 @@
+name: Deploy to Cloudflare Pages
+
+# 这个项目的 Cloudflare Pages「Git 集成」是断的（Pages 侧 source = None，
+# 最后一次自动部署停在 2026-04-12），所以推送到 GitHub 不会触发任何构建。
+# 这里改用 GitHub Actions + wrangler 直传部署，恢复「push 即上线」。
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 里配置三个 secret：
+#   CLOUDFLARE_API_KEY      Cloudflare 的 API Key（Global API Key 或 API Token）
+#   CLOUDFLARE_EMAIL        Cloudflare 登录邮箱（用 API Token 时可不填）
+#   CLOUDFLARE_ACCOUNT_ID   Cloudflare Account ID
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages
+        run: npx wrangler@latest pages deploy dist --project-name distillhub --branch main
+        env:
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
