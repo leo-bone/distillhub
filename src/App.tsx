@@ -394,6 +394,9 @@ function SkillDetailModal({
       if (res.status === 502 || res.status === 503) {
         throw new Error('Upstream: AI 服务暂时不可用（网关 ' + res.status + '），请稍后重试')
       }
+      if (res.status === 429) {
+        throw new Error('Upstream: 提问太快了，请停 10 秒再试（站点为控制成本对每个 IP 做了限速）')
+      }
       throw new Error(`API ${res.status}: ${body.slice(0, 200)}`)
     }
 
