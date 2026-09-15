@@ -25,6 +25,58 @@ const SSE_HEADERS = {
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
+// ─── 公开访问下的额度防护 ────────────────────────────────────────────────────
+// 站点对外公开，接口谁都能调，DeepSeek 额度是作者自付的。做两层廉价防护：
+//
+//  1) IP 限流。RATE_BUCKETS 是滑动窗口，两条规则同时生效（取更严的那条）。
+//     正常人聊天一分钟问不了 6 次，脚本刷接口会立刻撞线。
+//     注意：Pages Functions 跑在多个 isolate 上，计数不跨 isolate 共享，
+//     所以这是"削峰"而不是硬限。要硬限需接 KV / Durable Object /
+//     Cloudflare WAF 速率规则。即便如此，撞线的大流量已被砍掉绝大部分。
+//
+//  2) 输入长度截断。防止有人塞几万字进来一次烧掉大量 token。
+const RATE_BUCKETS = [
+  { windowMs: 60_000, max: 6 },
+  { windowMs: 600_000, max: 20 },
+];
+const MAX_INPUT_CHARS = 4000; // 单条消息
+const MAX_SYSTEM_CHARS = 8000; // 技能提示词（技能库本身最长约 2k，留足余量）
+const rateHits = new Map(); // ip -> number[] (timestamps)
+const RATE_TTL_MS = 600_000;
+
+function clientIP(request) {
+  return (
+    request.headers.get('cf-connecting-ip') ||
+    (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() ||
+    'unknown'
+  );
+}
+
+/** @returns null = 放行；否则返回被撞的那条规则（附带窗口内最早一次的时间） */
+function rateCheck(ip) {
+  const now = Date.now();
+  let arr = (rateHits.get(ip) || []).filter((t) => now - t < RATE_TTL_MS);
+
+  for (const b of RATE_BUCKETS) {
+    const inWindow = arr.filter((t) => now - t < b.windowMs);
+    if (inWindow.length >= b.max) {
+      rateHits.set(ip, arr);
+      return { ...b, oldest: inWindow[0] };
+    }
+  }
+
+  arr.push(now);
+  rateHits.set(ip, arr);
+
+  // 防止 Map 无限膨胀：条目过多时清掉已过期的
+  if (rateHits.size > 5000) {
+    for (const [k, v] of rateHits) {
+      if (!v.length || now - v[v.length - 1] > RATE_TTL_MS) rateHits.delete(k);
+    }
+  }
+  return null;
+}
+
 function sseEvent(payload) {
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
@@ -49,6 +101,11 @@ export async function onRequestGet(context) {
     function_running: true,
     api_key_configured: Boolean(key),
     api_key_prefix: key ? `${key.slice(0, 6)}...` : null,
+    access: 'public',
+    rate_limit: RATE_BUCKETS.map((b) => `${b.max} 次 / ${Math.round(b.windowMs / 1000)} 秒（按 IP）`),
+    history_window: 8,
+    max_input_chars: MAX_INPUT_CHARS,
+    max_tokens_cap: 3072,
     model: MODEL,
     upstream: DEEPSEEK_API,
     ts: new Date().toISOString(),
@@ -115,15 +172,15 @@ export async function onRequestPost(context) {
   const rawMessages = Array.isArray(payload.messages) ? payload.messages : [];
   const messages = rawMessages
     .filter((m) => m && typeof m.content === 'string' && m.content.trim())
-    .slice(-20)
+    .slice(-8)
     .map((m) => ({
       role: m.role === 'ai' || m.role === 'assistant' ? 'assistant' : 'user',
-      content: String(m.content),
+      content: String(m.content).slice(0, MAX_INPUT_CHARS),
     }));
 
   const systemPrompt =
     typeof payload.systemPrompt === 'string' && payload.systemPrompt.trim()
-      ? payload.systemPrompt
+      ? payload.systemPrompt.slice(0, MAX_SYSTEM_CHARS)
       : 'You are a helpful assistant.';
 
   if (!messages.length) {
@@ -133,11 +190,25 @@ export async function onRequestPost(context) {
     });
   }
 
-  const apiKey = context.env?.DEEPSEEK_API_KEY || '';
-  if (!apiKey) {
+const apiKey = context.env?.DEEPSEEK_API_KEY || '';
+if (!apiKey) {
+  return sseResponse([{
+    error: 'DEEPSEEK_API_KEY 未配置',
+    detail: 'Cloudflare Pages -> Settings -> Environment variables 添加 DEEPSEEK_API_KEY（Production 与 Preview 都要加），然后重新部署。',
+  }]);
+}
+
+  // 站点保持公开访问：任何人都能用，不设口令。
+  // 但做两层防护，避免脚本/爬虫把 DeepSeek 额度刷光：
+  //   1) 按 IP 限流（见文件顶部 RATE_BUCKETS）
+  //   2) 单次输入长度截断（见 MAX_INPUT_CHARS）
+  const ip = clientIP(context.request);
+  const limited = rateCheck(ip);
+  if (limited) {
+    const secs = Math.ceil((limited.windowMs - (Date.now() - limited.oldest)) / 1000);
     return sseResponse([{
-      error: 'DEEPSEEK_API_KEY 未配置',
-      detail: 'Cloudflare Pages -> Settings -> Environment variables 添加 DEEPSEEK_API_KEY（Production 与 Preview 都要加），然后重新部署。',
+      error: '请求太频繁',
+      hint: `为避免额度被批量刷掉，每个 IP 每 ${Math.round(limited.windowMs / 1000)} 秒最多 ${limited.max} 次提问。请 ${secs} 秒后重试。`,
     }]);
   }
 
@@ -156,7 +227,7 @@ export async function onRequestPost(context) {
         body: JSON.stringify({
           model: MODEL,
           messages: allMessages,
-          max_tokens: Number(payload.max_tokens) || 4096,
+          max_tokens: Math.min(Number(payload.max_tokens) || 3072, 3072),
           temperature: payload.temperature ?? 0.85,
           stream: useStream,
         }),
